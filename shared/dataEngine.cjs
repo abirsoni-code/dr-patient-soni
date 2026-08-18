@@ -205,4 +205,11 @@ async function handleAction(store, action, params) {
   }
 }
 
-module.exports = { handleAction, loadData, DEFAULT_DATA };
+class ConflictError extends Error {
+  constructor(message = "Concurrent update detected, please retry") {
+    super(message);
+    this.code = "CONFLICT";
+  }
+}
+
+module.exports = { handleAction, loadData, DEFAULT_DATA, ConflictError };

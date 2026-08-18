@@ -59,6 +59,16 @@ const fileStore = {
   },
 };
 
+// Serializes all requests through the file store so two concurrent local
+// requests can never interleave a read-modify-write and clobber each other
+// (mirrors the etag-based protection used against Netlify Blobs in prod).
+let mutex = Promise.resolve();
+function withLock(fn) {
+  const run = mutex.then(fn, fn);
+  mutex = run.then(() => {}, () => {});
+  return run;
+}
+
 const app = express();
 app.use(cors());
 // Parse JSON regardless of Content-Type header — browsers' fetch() defaults to
@@ -69,7 +79,7 @@ app.use(express.json({ type: () => true }));
 app.get("/api", async (req, res) => {
   const { action, ...params } = req.query;
   try {
-    const result = await handleAction(fileStore, action, params);
+    const result = await withLock(() => handleAction(fileStore, action, params));
     res.json({ ok: true, data: result });
   } catch (err) {
     res.json({ ok: false, error: err.message });
@@ -79,7 +89,7 @@ app.get("/api", async (req, res) => {
 app.post("/api", async (req, res) => {
   const { action, ...params } = req.body;
   try {
-    const result = await handleAction(fileStore, action, params);
+    const result = await withLock(() => handleAction(fileStore, action, params));
     res.json({ ok: true, data: result });
   } catch (err) {
     res.json({ ok: false, error: err.message });
