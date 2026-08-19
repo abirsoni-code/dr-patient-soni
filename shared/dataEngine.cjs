@@ -173,14 +173,24 @@ async function handleAction(store, action, params) {
     }
 
     case "listPrescriptions": {
-      const { appointmentId } = params;
+      const { appointmentId, requesterId } = params;
       const appt = data.appointments.find((a) => a.appointmentId === appointmentId);
       if (!appt) throw new Error("Appointment not found");
+      if (requesterId && requesterId !== appt.patientId && requesterId !== appt.doctorId) {
+        throw new Error("Not authorized to view this appointment's prescriptions");
+      }
       return Array.isArray(appt.prescriptions) ? appt.prescriptions : [];
     }
 
     case "getPrescriptionPhoto": {
-      const { prescriptionId } = params;
+      const { prescriptionId, requesterId } = params;
+      const appt = data.appointments.find(
+        (a) => Array.isArray(a.prescriptions) && a.prescriptions.some((p) => p.prescriptionId === prescriptionId)
+      );
+      if (!appt) throw new Error("Photo not found");
+      if (requesterId !== appt.patientId && requesterId !== appt.doctorId) {
+        throw new Error("Not authorized to view this photo");
+      }
       const blob = await store.getBlob(prescriptionId);
       if (!blob) throw new Error("Photo not found");
       return blob;
