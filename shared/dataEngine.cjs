@@ -40,12 +40,12 @@ async function handleAction(store, action, params) {
     }
 
     case "register": {
-      const { role, name, surname, address, mobile, photoUrl, username, password, city, area, opdTimings } = params;
+      const { role, name, surname, address, mobile, photoUrl, username, password, city, area, opdTimings, specialization } = params;
       if (!role || !name || !mobile || !username || !password) {
         throw new Error("Missing required fields");
       }
-      if (role === "Doctor" && (!city || !area || !opdTimings)) {
-        throw new Error("City, area and OPD timings are required for doctors");
+      if (role === "Doctor" && (!city || !area || !opdTimings || !specialization)) {
+        throw new Error("City, area, specialization and OPD timings are required for doctors");
       }
       if (data.users.some((u) => u.username.toLowerCase() === username.toLowerCase())) {
         throw new Error("Username already taken");
@@ -54,7 +54,7 @@ async function handleAction(store, action, params) {
       const user = {
         userId, role, name, surname: surname || "", address: address || "",
         mobile, photoUrl: photoUrl || "", username, password, createdAt: nowIso(),
-        ...(role === "Doctor" ? { city, area, opdTimings } : {}),
+        ...(role === "Doctor" ? { city, area, opdTimings, specialization } : {}),
       };
       data.users.push(user);
       await store.set(data);
@@ -81,6 +81,7 @@ async function handleAction(store, action, params) {
         .map((u) => ({
           userId: u.userId, name: u.name, surname: u.surname, photoUrl: u.photoUrl,
           city: u.city || "", area: u.area || "", opdTimings: u.opdTimings || "",
+          specialization: u.specialization || "",
         }));
     }
 

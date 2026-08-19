@@ -58,6 +58,7 @@ const mockDb = {
       address: "Riverside Clinic, Pune", mobile: "9876500001", photoUrl: "",
       username: "dr.kessler", password: "demo123",
       city: "Pune", area: "Baner", opdTimings: "09:00-11:30, 17:00-19:00",
+      specialization: "General Physician",
     },
     {
       userId: "pat-1", role: "Patient", name: "Rohan", surname: "Mehta",
@@ -101,16 +102,16 @@ async function mockCall(action, params) {
   await new Promise((res) => setTimeout(res, 220)); // simulate latency
   switch (action) {
     case "register": {
-      const { role, name, surname, address, mobile, photoUrl, username, password, city, area, opdTimings } = params;
+      const { role, name, surname, address, mobile, photoUrl, username, password, city, area, opdTimings, specialization } = params;
       if (!role || !name || !mobile || !username || !password) throw new Error("Missing required fields");
-      if (role === "Doctor" && (!city || !area || !opdTimings)) throw new Error("City, area and OPD timings are required for doctors");
+      if (role === "Doctor" && (!city || !area || !opdTimings || !specialization)) throw new Error("City, area, specialization and OPD timings are required for doctors");
       if (mockDb.users.some((u) => u.username.toLowerCase() === username.toLowerCase())) {
         throw new Error("Username already taken");
       }
       const userId = uuid();
       const user = {
         userId, role, name, surname: surname || "", address: address || "", mobile, photoUrl: photoUrl || "", username, password,
-        ...(role === "Doctor" ? { city, area, opdTimings } : {}),
+        ...(role === "Doctor" ? { city, area, opdTimings, specialization } : {}),
       };
       mockDb.users.push(user);
       return { ...user };
@@ -127,6 +128,7 @@ async function mockCall(action, params) {
       return mockDb.users.filter((u) => u.role === "Doctor").map((u) => ({
         userId: u.userId, name: u.name, surname: u.surname, photoUrl: u.photoUrl,
         city: u.city || "", area: u.area || "", opdTimings: u.opdTimings || "",
+        specialization: u.specialization || "",
       }));
     case "bookAppointment": {
       const { patientId, doctorId, patientName, doctorName, symptoms, date, time } = params;
@@ -807,7 +809,7 @@ function TopNav({ onBack, label }) {
 function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
   const [form, setForm] = useState({
     name: "", surname: "", address: "", mobile: "", photoUrl: "", username: "", password: "",
-    city: "", area: "", opdTimings: "",
+    city: "", area: "", opdTimings: "", specialization: "",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -827,8 +829,8 @@ function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
       setError("Enter a valid mobile number.");
       return;
     }
-    if (role === "Doctor" && (!form.city || !form.area || !form.opdTimings)) {
-      setError("City, area and OPD timings are required for doctors.");
+    if (role === "Doctor" && (!form.city || !form.area || !form.opdTimings || !form.specialization)) {
+      setError("City, area, specialization and OPD timings are required for doctors.");
       return;
     }
     setLoading(true);
@@ -888,6 +890,9 @@ function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
                 </Field>
               </div>
             </div>
+            <Field label="Specialization" required>
+              <TextInput value={form.specialization} onChange={(e) => set("specialization", e.target.value)} placeholder="e.g. Cardiologist, General Physician" />
+            </Field>
             <Field label="OPD timings" required>
               <OpdTimingsInput
                 value={form.opdTimings}
@@ -937,6 +942,7 @@ function EditProfileScreen({ user, onBack, onSaved }) {
     name: user.name || "", surname: user.surname || "", address: user.address || "",
     mobile: user.mobile || "", photoUrl: user.photoUrl || "",
     city: user.city || "", area: user.area || "", opdTimings: user.opdTimings || "",
+    specialization: user.specialization || "",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -956,8 +962,8 @@ function EditProfileScreen({ user, onBack, onSaved }) {
       setError("Enter a valid mobile number.");
       return;
     }
-    if (user.role === "Doctor" && (!form.city || !form.area || !form.opdTimings)) {
-      setError("City, area and OPD timings are required for doctors.");
+    if (user.role === "Doctor" && (!form.city || !form.area || !form.opdTimings || !form.specialization)) {
+      setError("City, area, specialization and OPD timings are required for doctors.");
       return;
     }
     setLoading(true);
@@ -1017,6 +1023,9 @@ function EditProfileScreen({ user, onBack, onSaved }) {
                 </Field>
               </div>
             </div>
+            <Field label="Specialization" required>
+              <TextInput value={form.specialization} onChange={(e) => set("specialization", e.target.value)} placeholder="e.g. Cardiologist, General Physician" />
+            </Field>
             <Field label="OPD timings" required>
               <OpdTimingsInput value={form.opdTimings} onChange={(val) => set("opdTimings", val)} />
             </Field>
@@ -1789,7 +1798,7 @@ function BookingFlow({ user, rescheduling, onCancelReschedule, onBooked }) {
                       <option value="">Select a doctor…</option>
                       {doctorsInArea.map((d) => (
                         <option key={d.userId} value={d.userId}>
-                          Dr. {d.name} {d.surname} — OPD {d.opdTimings}
+                          Dr. {d.name} {d.surname}{d.specialization ? ` — ${d.specialization}` : ""} — OPD {d.opdTimings}
                         </option>
                       ))}
                     </select>
