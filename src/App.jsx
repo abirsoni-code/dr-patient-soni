@@ -213,8 +213,9 @@ async function mockCall(action, params) {
         (a) => Array.isArray(a.prescriptions) && a.prescriptions.some((p) => p.prescriptionId === prescriptionId)
       );
       if (!appt) throw new Error("Prescription not found");
-      if (requesterId !== appt.patientId && requesterId !== appt.doctorId) {
-        throw new Error("Not authorized to delete this prescription");
+      const item = appt.prescriptions.find((p) => p.prescriptionId === prescriptionId);
+      if (requesterId !== item.uploaderId) {
+        throw new Error("Only the person who uploaded a file can delete it");
       }
       appt.prescriptions = appt.prescriptions.filter((p) => p.prescriptionId !== prescriptionId);
       delete mockPhotos[prescriptionId];
@@ -1253,9 +1254,11 @@ function PrescriptionSection({ appointmentId, currentUserId }) {
                 <button type="button" onClick={() => view(item)} style={{ border: "none", background: "none", color: COLORS.teal, fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
                   {viewLoadingId === item.prescriptionId ? "…" : "View"}
                 </button>
-                <button type="button" onClick={() => remove(item)} style={{ border: "none", background: "none", color: COLORS.bad, fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
-                  Delete
-                </button>
+                {item.uploaderId === currentUserId && (
+                  <button type="button" onClick={() => remove(item)} style={{ border: "none", background: "none", color: COLORS.bad, fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+                    Delete
+                  </button>
+                )}
               </div>
             </div>
           ))}

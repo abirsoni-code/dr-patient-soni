@@ -192,8 +192,9 @@ async function handleAction(store, action, params) {
         (a) => Array.isArray(a.prescriptions) && a.prescriptions.some((p) => p.prescriptionId === prescriptionId)
       );
       if (!appt) throw new Error("Prescription not found");
-      if (requesterId !== appt.patientId && requesterId !== appt.doctorId) {
-        throw new Error("Not authorized to delete this prescription");
+      const item = appt.prescriptions.find((p) => p.prescriptionId === prescriptionId);
+      if (requesterId !== item.uploaderId) {
+        throw new Error("Only the person who uploaded a file can delete it");
       }
       appt.prescriptions = appt.prescriptions.filter((p) => p.prescriptionId !== prescriptionId);
       await store.deleteBlob(prescriptionId);
