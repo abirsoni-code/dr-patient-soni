@@ -1,0 +1,12 @@
+rules_version = '2';
+
+// Prescription photos are uploaded/read only through Cloud Functions using
+// the Admin SDK (which bypasses these rules), so uploader/participant-only
+// authorization stays centralized in dataEngine.cjs instead of duplicated here.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
