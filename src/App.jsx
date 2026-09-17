@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
+import { createUserWithEmailAndPassword, signInWithEmailAndPassword } from "firebase/auth";
+import { auth } from "./firebaseConfig.js";
 
 /**
  * ============================================================================
@@ -273,6 +275,26 @@ async function realCall(action, params) {
   const json = await res.json();
   if (!json.ok) throw new Error(json.error || "Request failed");
   return json.data;
+}
+
+// The real backend uses Firebase Authentication, which requires an email.
+// Users only ever enter a username, so we derive a stable synthetic email
+// from it — this keeps the existing username-based login UX unchanged
+// while letting Firebase Auth own credentials (no passwords stored in our
+// own database — see Step 3 of the Firebase migration).
+function usernameToEmail(username) {
+  return `${(username || "").trim().toLowerCase()}@dp-app.local`;
+}
+
+function friendlyAuthError(err) {
+  const code = err && err.code;
+  if (code === "auth/email-already-in-use") return "Username already taken";
+  if (code === "auth/weak-password") return "Password should be at least 6 characters";
+  if (code === "auth/invalid-email") return "Enter a valid username";
+  if (code === "auth/wrong-password" || code === "auth/user-not-found" || code === "auth/invalid-credential") {
+    return "Invalid username or password";
+  }
+  return err.message || "Something went wrong. Please try again.";
 }
 
 async function api(action, params = {}) {
@@ -753,10 +775,20 @@ function LoginScreen({ role, onBack, onLogin, onGoRegister }) {
     }
     setLoading(true);
     try {
-      const user = await api("login", { username, password, role });
-      onLogin(user);
+      const reachable = await probeBackend();
+      if (reachable) {
+        const cred = await signInWithEmailAndPassword(auth, usernameToEmail(username), password);
+        const idToken = await cred.user.getIdToken();
+        const user = await api("getProfile", { role, idToken });
+        onLogin(user);
+      } else {
+        // Offline demo mode — no Firebase network access, use the original
+        // in-memory mock login unchanged.
+        const user = await api("login", { username, password, role });
+        onLogin(user);
+      }
     } catch (err) {
-      setError(err.message);
+      setError(friendlyAuthError(err));
     } finally {
       setLoading(false);
     }
@@ -846,10 +878,21 @@ function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
     }
     setLoading(true);
     try {
-      const user = await api("register", { role, ...form });
-      onRegistered(user);
+      const reachable = await probeBackend();
+      if (reachable) {
+        const { password, ...profileFields } = form;
+        const cred = await createUserWithEmailAndPassword(auth, usernameToEmail(form.username), password);
+        const idToken = await cred.user.getIdToken();
+        const user = await api("register", { role, ...profileFields, idToken });
+        onRegistered(user);
+      } else {
+        // Offline demo mode — no Firebase network access, use the original
+        // in-memory mock registration unchanged.
+        const user = await api("register", { role, ...form });
+        onRegistered(user);
+      }
     } catch (err) {
-      setError(err.message);
+      setError(friendlyAuthError(err));
     } finally {
       setLoading(false);
     }
