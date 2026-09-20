@@ -11,16 +11,36 @@ rules_version = '2';
 //                                       server-side listDoctors() action.
 //                                       Written only by that doctor, and only
 //                                       when their users/{uid}.role == "Doctor".
-//   appointments/{apptId}                patientId, doctorId, ... Only the
-//                                       two participants can read/write.
+//   appointments/{apptId}                patientId, doctorId, agentId (nullable
+//                                       — set when a Swasthmitra agent booked
+//                                       it on the patient's behalf), opdFee,
+//                                       agentCommission (10% snapshot),
+//                                       paymentStatus ("Pending"|"Paid").
+//                                       Participants (patient, doctor, and
+//                                       the booking agent if any) can read/write.
 //   slots/{doctorId_date_time}          Existence-only lock doc used to
 //                                       prevent double-booking (see below).
 //                                       Value: { appointmentId }.
+//   config/payment                      Platform-wide payment config (UPI ID
+//                                       and/or a static QR image) that QR
+//                                       codes are generated from. Readable by
+//                                       any signed-in user; only editable
+//                                       directly via the Firebase console —
+//                                       no in-app admin UI yet.
 //   appointments/{apptId}/prescriptions/{prescriptionId}
-//                                       Photo stored inline as base64
-//                                       (photoBase64 field) — no Storage
-//                                       service used, stays on the free
-//                                       Spark plan. Capped well under
+//                                       Metadata only (uploaderId, fileName,
+//                                       contentType, uploadedAt) — cheap to
+//                                       list. The Firestore web SDK can't do
+//                                       partial-field reads, so the photo
+//                                       itself lives in a sibling doc fetched
+//                                       only when a "View" is actually clicked:
+//   appointments/{apptId}/prescriptionPhotos/{prescriptionId}
+//                                       { uploaderId, photoBase64, contentType }
+//                                       uploaderId is duplicated here (rather
+//                                       than read from the sibling doc) so
+//                                       this doc's own rules don't need to
+//                                       read another doc created in the same
+//                                       upload batch. Capped well under
 //                                       Firestore's 1MB document limit.
 //
 // Double-booking prevention: booking a slot means creating BOTH the
@@ -40,14 +60,17 @@ function isOwner(uid) {
 
 function apptParticipant(apptId) {
   let appt = get(/databases/$(database)/documents/appointments/$(apptId)).data;
-  return signedIn() && (request.auth.uid == appt.patientId || request.auth.uid == appt.doctorId);
+  return signedIn() && (request.auth.uid == appt.patientId || request.auth.uid == appt.doctorId
+                        || ("agentId" in appt && request.auth.uid == appt.agentId));
 }
 
 service cloud.firestore {
   match /databases/{database}/documents {
 
     match /users/{uid} {
-      allow read: if isOwner(uid);
+      allow read: if isOwner(uid)
+                  || (signedIn() && "registeredByAgentId" in resource.data
+                      && resource.data.registeredByAgentId == request.auth.uid);
       allow create: if isOwner(uid) && request.resource.data.userId == uid;
       allow update: if isOwner(uid) && request.resource.data.userId == uid
                     && request.resource.data.role == resource.data.role; // role can't be changed after signup
@@ -62,15 +85,28 @@ service cloud.firestore {
       allow write: if isOwner(uid)
                    && request.resource.data.userId == uid
                    && request.resource.data.name is string
-                   && request.resource.data.specialization is string;
+                   && request.resource.data.specialization is string
+                   // opdFee is optional for now (until Module 2 ships the UI
+                   // field) — once present, it must be a valid non-negative number.
+                   && (!("opdFee" in request.resource.data)
+                       || (request.resource.data.opdFee is number && request.resource.data.opdFee >= 0));
+    }
+
+    match /config/{docId} {
+      allow read: if signedIn();
+      allow write: if false; // set directly via the Firebase console for now
     }
 
     match /appointments/{apptId} {
       allow read: if apptParticipant(apptId);
       allow create: if signedIn()
-                    && request.resource.data.patientId == request.auth.uid
-                    && request.resource.data.status == "Confirmed";
-      // Only status/date/time may change (reschedule/cancel), and only by a participant.
+                    && request.resource.data.status == "Confirmed"
+                    && (request.resource.data.patientId == request.auth.uid
+                        || request.resource.data.agentId == request.auth.uid);
+      // Only status/date/time/paymentStatus may change (reschedule/cancel/pay),
+      // and only by a participant. patientId/doctorId can't be reassigned.
+      // (agentId is intentionally not checked here — older appointment docs
+      // predating this field would throw on a missing-field read otherwise.)
       allow update: if apptParticipant(apptId)
                     && request.resource.data.patientId == resource.data.patientId
                     && request.resource.data.doctorId == resource.data.doctorId;
@@ -86,6 +122,13 @@ service cloud.firestore {
     }
 
     match /appointments/{apptId}/prescriptions/{prescriptionId} {
+      allow read: if apptParticipant(apptId);
+      allow create: if apptParticipant(apptId) && request.resource.data.uploaderId == request.auth.uid;
+      allow delete: if apptParticipant(apptId) && resource.data.uploaderId == request.auth.uid;
+      allow update: if false;
+    }
+
+    match /appointments/{apptId}/prescriptionPhotos/{prescriptionId} {
       allow read: if apptParticipant(apptId);
       allow create: if apptParticipant(apptId)
                     && request.resource.data.uploaderId == request.auth.uid

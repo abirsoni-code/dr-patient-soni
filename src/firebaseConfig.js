@@ -1,6 +1,5 @@
 // Firebase SDK initialization for the frontend.
-// Not yet used by App.jsx — wired in during the Auth step of the migration.
-import { initializeApp } from "firebase/app";
+import { initializeApp, deleteApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 
@@ -16,3 +15,21 @@ const firebaseConfig = {
 export const firebaseApp = initializeApp(firebaseConfig);
 export const auth = getAuth(firebaseApp);
 export const db = getFirestore(firebaseApp);
+
+// Creates a throwaway secondary Firebase App + Auth + Firestore instance.
+// Used when a Swasthmitra agent creates a login account for a doctor/patient
+// on their behalf: calling createUserWithEmailAndPassword on the PRIMARY
+// auth instance would sign the agent out of their own session and into the
+// new account. Running it on a separate app instance instead creates and
+// signs in the new user there, leaving the agent's own primary session
+// completely untouched. Call cleanup() when done to tear it down.
+export function createSecondaryAuthSession() {
+  const secondaryApp = initializeApp(firebaseConfig, `agent-create-${Date.now()}`);
+  const secondaryAuth = getAuth(secondaryApp);
+  const secondaryDb = getFirestore(secondaryApp);
+  return {
+    auth: secondaryAuth,
+    db: secondaryDb,
+    cleanup: () => deleteApp(secondaryApp).catch(() => {}),
+  };
+}

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
 import { createUserWithEmailAndPassword, signInWithEmailAndPassword } from "firebase/auth";
 import { doc, getDoc, setDoc, writeBatch, collection, query, where, getDocs, deleteDoc, updateDoc, documentId } from "firebase/firestore";
-import { auth, db } from "./firebaseConfig.js";
+import { auth, db, createSecondaryAuthSession } from "./firebaseConfig.js";
 
 /**
  * ============================================================================
@@ -50,6 +50,16 @@ function usernameToEmail(username) {
   return `${(username || "").trim().toLowerCase()}@dp-app.local`;
 }
 
+// Generates a short, readable temporary password for accounts a Swasthmitra
+// agent creates on behalf of a doctor/patient — meant to be shared with them
+// verbally or written down, not memorized long-term.
+function generateTempPassword() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0/O/1/I
+  let out = "";
+  for (let i = 0; i < 8; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
 function friendlyAuthError(err) {
   const code = err && err.code;
   if (code === "auth/email-already-in-use") return "Username already taken";
@@ -69,17 +79,18 @@ function doctorDirectoryFields(u) {
     userId: u.userId, name: u.name, surname: u.surname || "", photoUrl: u.photoUrl || "",
     city: u.city || "", area: u.area || "", opdTimings: u.opdTimings || "",
     specialization: u.specialization || "",
+    ...(typeof u.opdFee === "number" && u.opdFee >= 0 ? { opdFee: u.opdFee } : {}),
   };
 }
 
 // Writes users/{uid} and, for doctors, doctorDirectory/{uid} in one atomic
 // batch, so a doctor's profile and their public directory entry never drift
 // out of sync with each other.
-async function writeUserProfile(uid, userDoc) {
-  const batch = writeBatch(db);
-  batch.set(doc(db, "users", uid), userDoc);
+async function writeUserProfile(uid, userDoc, dbInstance = db) {
+  const batch = writeBatch(dbInstance);
+  batch.set(doc(dbInstance, "users", uid), userDoc);
   if (userDoc.role === "Doctor") {
-    batch.set(doc(db, "doctorDirectory", uid), doctorDirectoryFields(userDoc));
+    batch.set(doc(dbInstance, "doctorDirectory", uid), doctorDirectoryFields(userDoc));
   }
   await batch.commit();
 }
@@ -101,6 +112,15 @@ async function listDoctorsDirect() {
   return snap.docs.map((d) => d.data());
 }
 
+// Doctors/patients a Swasthmitra agent can book for are scoped to whoever
+// THEY registered (see Module 3) — the users/{uid} read rule only grants an
+// agent access to profiles with matching registeredByAgentId.
+async function listMyRegisteredUsersDirect(agentId, role) {
+  const q = query(collection(db, "users"), where("registeredByAgentId", "==", agentId), where("role", "==", role));
+  const snap = await getDocs(q);
+  return snap.docs.map((d) => d.data());
+}
+
 async function doctorAppointmentsDirect(doctorId, date) {
   const q = query(collection(db, "appointments"), where("doctorId", "==", doctorId), where("date", "==", date));
   const snap = await getDocs(q);
@@ -116,17 +136,33 @@ async function patientAppointmentsDirect(patientId) {
   return snap.docs.map((d) => d.data()).sort((a, b) => (a.date + a.time < b.date + b.time ? 1 : -1));
 }
 
+async function agentAppointmentsDirect(agentId) {
+  const q = query(collection(db, "appointments"), where("agentId", "==", agentId));
+  const snap = await getDocs(q);
+  return snap.docs.map((d) => d.data()).sort((a, b) => (a.date + a.time < b.date + b.time ? 1 : -1));
+}
+
 // Books an appointment by writing appointments/{autoId} and slots/{doctorId_date_time}
 // in one atomic batch. The slot doc's create rule requires it not already
 // exist, so if two patients race for the same slot, only one batch commits —
 // the loser gets a clear "slot just taken" error instead of a silent double-booking.
-async function bookAppointmentDirect({ patientId, doctorId, patientName, doctorName, symptoms, date, time }) {
+async function bookAppointmentDirect({
+  patientId, doctorId, patientName, doctorName, symptoms, date, time,
+  agentId = null, opdFee = null,
+}) {
   const apptRef = doc(collection(db, "appointments"));
   const slotRef = doc(db, "slots", slotId(doctorId, date, time));
+  const hasFee = typeof opdFee === "number" && opdFee > 0;
   const appt = {
     appointmentId: apptRef.id, patientId, doctorId,
     patientName: patientName || "", doctorName: doctorName || "",
     symptoms: symptoms || "", date, time, status: "Confirmed",
+    agentId: agentId || null,
+    opdFee: hasFee ? opdFee : null,
+    // 10% commission, snapshotted at booking time so it doesn't drift if the
+    // doctor changes their OPD fee later.
+    agentCommission: agentId && hasFee ? Math.round(opdFee * 0.10 * 100) / 100 : null,
+    paymentStatus: agentId && hasFee ? "Pending" : null,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
   };
   const batch = writeBatch(db);
@@ -138,6 +174,23 @@ async function bookAppointmentDirect({ patientId, doctorId, patientName, doctorN
     throw new Error("That slot was just booked by someone else — please pick another time.");
   }
   return appt;
+}
+
+// Marks an agent-booked appointment's OPD fee as paid (manual confirmation —
+// no payment gateway is integrated yet).
+async function markAppointmentPaidDirect(appointmentId) {
+  await updateDoc(doc(db, "appointments", appointmentId), {
+    paymentStatus: "Paid", paidAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  });
+}
+
+// config/payment is set directly via the Firebase console (see firestore.rules) —
+// either { upiId, payeeName } for a dynamically-generated QR, or
+// { qrImageBase64 } for a static uploaded QR image. Both may be present;
+// the UI prefers the static image when available.
+async function getPaymentConfigDirect() {
+  const snap = await getDoc(doc(db, "config", "payment"));
+  return snap.exists() ? snap.data() : null;
 }
 
 async function rescheduleAppointmentDirect({ appointmentId, doctorId, oldDate, oldTime, date, time }) {
@@ -264,6 +317,15 @@ function IconStethoscope({ size = 18, color = COLORS.teal }) {
       <path d="M5 3v6a4 4 0 0 0 8 0V3" stroke={color} strokeWidth="1.6" strokeLinecap="round" />
       <path d="M9 13v2a5 5 0 0 0 10 0v-2.5" stroke={color} strokeWidth="1.6" strokeLinecap="round" />
       <circle cx="19" cy="9.5" r="2" stroke={color} strokeWidth="1.6" />
+    </svg>
+  );
+}
+function IconHandshake({ size = 18, color = COLORS.teal }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <path d="M2 12l4-4 4 3 2-2 4 4-2 2-4-3-2 2z" stroke={color} strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M13 13l3 3 4-4-3-3" stroke={color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M6 8l3-3 3 1" stroke={color} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -512,6 +574,8 @@ function StatusPill({ status }) {
     Confirmed: { bg: `${COLORS.good}18`, fg: COLORS.good },
     Rescheduled: { bg: `${COLORS.warn}18`, fg: COLORS.warn },
     Cancelled: { bg: `${COLORS.bad}18`, fg: COLORS.bad },
+    Paid: { bg: `${COLORS.good}18`, fg: COLORS.good },
+    Pending: { bg: `${COLORS.warn}18`, fg: COLORS.warn },
   };
   const c = map[status] || map.Confirmed;
   return (
@@ -618,6 +682,13 @@ function RoleSelectScreen({ onSelect }) {
           desc="See your day's patient list at a glance."
           icon={<IconStethoscope size={22} color={COLORS.white} />}
           onClick={() => onSelect("Doctor")}
+        />
+        <RoleCard
+          role="Swasthmitra"
+          title="I'm a Swasthmitra"
+          desc="Register patients and doctors, and book visits on their behalf."
+          icon={<IconHandshake size={22} color={COLORS.white} />}
+          onClick={() => onSelect("Swasthmitra")}
         />
       </div>
 
@@ -745,7 +816,7 @@ function TopNav({ onBack, label }) {
 function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
   const [form, setForm] = useState({
     name: "", surname: "", address: "", mobile: "", photoUrl: "", username: "", password: "",
-    city: "", area: "", opdTimings: "", specialization: "",
+    city: "", area: "", opdTimings: "", specialization: "", opdFee: "",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -769,11 +840,18 @@ function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
       setError("City, area, specialization and OPD timings are required for doctors.");
       return;
     }
+    if (role === "Doctor" && (!form.opdFee || Number(form.opdFee) <= 0)) {
+      setError("Enter a valid OPD fee.");
+      return;
+    }
     setLoading(true);
     try {
-      const { password, ...profileFields } = form;
+      const { password, opdFee, ...profileFields } = form;
       const cred = await createUserWithEmailAndPassword(auth, usernameToEmail(form.username), password);
-      const userDoc = { userId: cred.user.uid, role, createdAt: new Date().toISOString(), ...profileFields };
+      const userDoc = {
+        userId: cred.user.uid, role, createdAt: new Date().toISOString(), ...profileFields,
+        ...(role === "Doctor" ? { opdFee: Number(opdFee) } : {}),
+      };
       try {
         await writeUserProfile(cred.user.uid, userDoc);
       } catch (writeErr) {
@@ -845,6 +923,14 @@ function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
                 onChange={(val) => set("opdTimings", val)}
               />
             </Field>
+            <Field label="OPD fee (₹)" required>
+              <TextInput
+                value={form.opdFee}
+                onChange={(e) => set("opdFee", e.target.value.replace(/[^0-9]/g, ""))}
+                placeholder="500"
+                inputMode="numeric"
+              />
+            </Field>
           </>
         )}
 
@@ -881,6 +967,481 @@ function RegisterScreen({ role, onBack, onRegistered, onGoLogin }) {
 }
 
 // ---------------------------------------------------------------------------
+// Screen: Swasthmitra registers a Doctor/Patient on their behalf
+// ---------------------------------------------------------------------------
+function AgentRegisterScreen({ role, agent, onBack, onDone }) {
+  const blankForm = {
+    name: "", surname: "", address: "", mobile: "", photoUrl: "", username: "",
+    tempPassword: generateTempPassword(),
+    city: "", area: "", opdTimings: "", specialization: "", opdFee: "",
+  };
+  const [form, setForm] = useState(blankForm);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [created, setCreated] = useState(null); // { username, tempPassword, name } once done
+
+  function set(k, v) {
+    setForm((f) => ({ ...f, [k]: v }));
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    if (!form.name || !form.mobile || !form.username || !form.tempPassword) {
+      setError("Name, mobile number, username and a temporary password are required.");
+      return;
+    }
+    if (!/^[0-9+\-\s]{7,15}$/.test(form.mobile)) {
+      setError("Enter a valid mobile number.");
+      return;
+    }
+    if (form.tempPassword.length < 6) {
+      setError("Temporary password should be at least 6 characters.");
+      return;
+    }
+    if (role === "Doctor" && (!form.city || !form.area || !form.opdTimings || !form.specialization)) {
+      setError("City, area, specialization and OPD timings are required for doctors.");
+      return;
+    }
+    if (role === "Doctor" && (!form.opdFee || Number(form.opdFee) <= 0)) {
+      setError("Enter a valid OPD fee.");
+      return;
+    }
+    setLoading(true);
+    // Create the account on a throwaway secondary Firebase session, so the
+    // agent's own signed-in session is never touched.
+    const session = createSecondaryAuthSession();
+    try {
+      const { tempPassword, opdFee, ...profileFields } = form;
+      const cred = await createUserWithEmailAndPassword(session.auth, usernameToEmail(form.username), tempPassword);
+      const userDoc = {
+        userId: cred.user.uid, role, createdAt: new Date().toISOString(),
+        registeredByAgentId: agent.userId, ...profileFields,
+        ...(role === "Doctor" ? { opdFee: Number(opdFee) } : {}),
+      };
+      try {
+        await writeUserProfile(cred.user.uid, userDoc, session.db);
+      } catch (writeErr) {
+        await cred.user.delete().catch(() => {});
+        throw writeErr;
+      }
+      setCreated({ username: form.username, tempPassword, name: form.name });
+      setForm(blankForm);
+    } catch (err) {
+      setError(friendlyAuthError(err));
+    } finally {
+      await session.cleanup();
+      setLoading(false);
+    }
+  }
+
+  if (created) {
+    return (
+      <div style={{ padding: "0 24px 32px" }}>
+        <TopNav onBack={onBack} label={`${role} Registered`} />
+        <div
+          style={{
+            marginTop: 20, padding: "20px", background: COLORS.white,
+            border: `1px solid ${COLORS.good}55`, borderRadius: 14,
+          }}
+        >
+          <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.ink, marginBottom: 4 }}>
+            {created.name} is registered
+          </div>
+          <div style={{ fontSize: 13, color: "#6B7A76", marginBottom: 14 }}>
+            Share these sign-in details with them directly — this is shown only once.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ background: COLORS.parchmentDim, borderRadius: 8, padding: "10px 12px" }}>
+              <div style={{ fontSize: 11, color: "#6B7A76", textTransform: "uppercase", letterSpacing: 0.5 }}>Username</div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.ink }}>{created.username}</div>
+            </div>
+            <div style={{ background: COLORS.parchmentDim, borderRadius: 8, padding: "10px 12px" }}>
+              <div style={{ fontSize: 11, color: "#6B7A76", textTransform: "uppercase", letterSpacing: 0.5 }}>Temporary password</div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.ink }}>{created.tempPassword}</div>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <Button variant="ghost" full onClick={() => setCreated(null)}>Register another {role}</Button>
+          <Button full onClick={onDone}>Done</Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: "0 24px 32px" }}>
+      <TopNav onBack={onBack} label={`Register a ${role}`} />
+      <div style={{ padding: "8px 0 20px" }}>
+        <h1 style={{ fontFamily: FONT_DISPLAY, fontSize: 24, color: COLORS.ink, margin: "8px 0 4px" }}>
+          {role} details
+        </h1>
+        <p style={{ fontSize: 13.5, color: "#6B7A76", margin: 0 }}>
+          You're creating this account on their behalf — they can log in with the temporary password below.
+        </p>
+      </div>
+
+      {error && <Banner text={error} tone="error" onClose={() => setError("")} />}
+
+      <form onSubmit={submit}>
+        <div style={{ display: "flex", gap: 12 }}>
+          <div style={{ flex: 1 }}>
+            <Field label="First name" required>
+              <TextInput value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="Rohan" />
+            </Field>
+          </div>
+          <div style={{ flex: 1 }}>
+            <Field label="Surname">
+              <TextInput value={form.surname} onChange={(e) => set("surname", e.target.value)} placeholder="Mehta" />
+            </Field>
+          </div>
+        </div>
+
+        <Field label="Address">
+          <TextInput value={form.address} onChange={(e) => set("address", e.target.value)} placeholder="Street, City" />
+        </Field>
+
+        {role === "Doctor" && (
+          <>
+            <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <Field label="City" required>
+                  <TextInput value={form.city} onChange={(e) => set("city", e.target.value)} placeholder="Pune" />
+                </Field>
+              </div>
+              <div style={{ flex: 1 }}>
+                <Field label="Area" required>
+                  <TextInput value={form.area} onChange={(e) => set("area", e.target.value)} placeholder="Baner" />
+                </Field>
+              </div>
+            </div>
+            <Field label="Specialization" required>
+              <TextInput value={form.specialization} onChange={(e) => set("specialization", e.target.value)} placeholder="e.g. Cardiologist, General Physician" />
+            </Field>
+            <Field label="OPD timings" required>
+              <OpdTimingsInput value={form.opdTimings} onChange={(val) => set("opdTimings", val)} />
+            </Field>
+            <Field label="OPD fee (₹)" required>
+              <TextInput
+                value={form.opdFee}
+                onChange={(e) => set("opdFee", e.target.value.replace(/[^0-9]/g, ""))}
+                placeholder="500"
+                inputMode="numeric"
+              />
+            </Field>
+          </>
+        )}
+
+        <Field label="Mobile number" required>
+          <TextInput value={form.mobile} onChange={(e) => set("mobile", e.target.value)} placeholder="98765 00000" inputMode="tel" />
+        </Field>
+
+        <Field label="Photo (optional)">
+          <PhotoUploadInput value={form.photoUrl} onChange={(val) => set("photoUrl", val)} />
+        </Field>
+
+        <div style={{ height: 1, background: COLORS.line, margin: "6px 0 20px" }} />
+
+        <Field label="Username" required>
+          <TextInput value={form.username} onChange={(e) => set("username", e.target.value)} placeholder="Choose a username" autoCapitalize="none" />
+        </Field>
+        <Field label="Temporary password" required>
+          <div style={{ display: "flex", gap: 8 }}>
+            <div style={{ flex: 1 }}>
+              <TextInput value={form.tempPassword} onChange={(e) => set("tempPassword", e.target.value)} placeholder="Temporary password" />
+            </div>
+            <Button type="button" variant="ghost" onClick={() => set("tempPassword", generateTempPassword())}>
+              New
+            </Button>
+          </div>
+        </Field>
+
+        <Button type="submit" full disabled={loading} style={{ marginTop: 6 }}>
+          {loading ? <Spinner /> : `Register ${role}`}
+        </Button>
+      </form>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Swasthmitra books a visit on behalf of a doctor+patient they
+// registered, then shows a QR code for the OPD fee payment.
+// ---------------------------------------------------------------------------
+function AgentBookingScreen({ agent, onBack, onDone }) {
+  const [doctors, setDoctors] = useState([]);
+  const [patients, setPatients] = useState([]);
+  const [loadingLists, setLoadingLists] = useState(true);
+  const [doctorId, setDoctorId] = useState("");
+  const [patientId, setPatientId] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [time, setTime] = useState("");
+  const [symptoms, setSymptoms] = useState("");
+  const [bookedTimes, setBookedTimes] = useState([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [booked, setBooked] = useState(null); // the created appointment, once booked
+  const [paymentConfig, setPaymentConfig] = useState(null);
+  const [marking, setMarking] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      setLoadingLists(true);
+      try {
+        const [docs, pats] = await Promise.all([
+          listMyRegisteredUsersDirect(agent.userId, "Doctor"),
+          listMyRegisteredUsersDirect(agent.userId, "Patient"),
+        ]);
+        setDoctors(docs);
+        setPatients(pats);
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoadingLists(false);
+      }
+    })();
+  }, [agent.userId]);
+
+  const selectedDoctor = doctors.find((d) => d.userId === doctorId);
+  const selectedPatient = patients.find((p) => p.userId === patientId);
+  const availableSlots = useMemo(
+    () => (selectedDoctor ? slotsFromOpdTimings(selectedDoctor.opdTimings) : []),
+    [selectedDoctor]
+  );
+
+  useEffect(() => {
+    if (!doctorId || !date) {
+      setBookedTimes([]);
+      return;
+    }
+    (async () => {
+      try {
+        setBookedTimes(await takenTimesDirect(doctorId, date));
+      } catch {
+        setBookedTimes([]);
+      }
+    })();
+  }, [doctorId, date]);
+
+  async function submit() {
+    setError("");
+    if (!doctorId || !patientId || !date || !time || !symptoms.trim()) {
+      setError("Please choose a doctor, patient, date, time, and describe the symptoms.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const appt = await bookAppointmentDirect({
+        patientId,
+        doctorId,
+        patientName: `${selectedPatient.name} ${selectedPatient.surname || ""}`.trim(),
+        doctorName: `Dr. ${selectedDoctor.name} ${selectedDoctor.surname || ""}`.trim(),
+        symptoms: symptoms.trim(),
+        date, time,
+        agentId: agent.userId,
+        opdFee: selectedDoctor.opdFee,
+      });
+      setBooked(appt);
+      getPaymentConfigDirect().then(setPaymentConfig).catch(() => setPaymentConfig(null));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function markPaid() {
+    setMarking(true);
+    try {
+      await markAppointmentPaidDirect(booked.appointmentId);
+      setBooked((b) => ({ ...b, paymentStatus: "Paid" }));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMarking(false);
+    }
+  }
+
+  if (booked) {
+    const upiLink = paymentConfig?.upiId
+      ? `upi://pay?pa=${encodeURIComponent(paymentConfig.upiId)}&pn=${encodeURIComponent(paymentConfig.payeeName || "Clinic")}&am=${booked.opdFee}&cu=INR&tn=${encodeURIComponent("OPD fee - " + booked.patientName)}`
+      : null;
+    const qrSrc = paymentConfig?.qrImageBase64
+      ? paymentConfig.qrImageBase64
+      : upiLink
+      ? `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(upiLink)}`
+      : null;
+
+    return (
+      <div style={{ padding: "0 24px 32px" }}>
+        <TopNav onBack={onDone} label="Visit Booked" />
+        <div style={{ marginTop: 16, padding: 20, background: COLORS.white, border: `1px solid ${COLORS.good}55`, borderRadius: 14 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.ink, marginBottom: 2 }}>
+            {booked.patientName} with {booked.doctorName}
+          </div>
+          <div style={{ fontSize: 13, color: "#6B7A76", marginBottom: 16 }}>
+            {booked.date} at {booked.time}
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderTop: `1px dashed ${COLORS.line}` }}>
+            <span style={{ fontSize: 13, color: "#6B7A76" }}>OPD fee</span>
+            <span style={{ fontSize: 14, fontWeight: 700, color: COLORS.ink }}>₹{booked.opdFee}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderTop: `1px dashed ${COLORS.line}` }}>
+            <span style={{ fontSize: 13, color: "#6B7A76" }}>Your commission (10%)</span>
+            <span style={{ fontSize: 14, fontWeight: 700, color: COLORS.teal }}>₹{booked.agentCommission}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderTop: `1px dashed ${COLORS.line}` }}>
+            <span style={{ fontSize: 13, color: "#6B7A76" }}>Payment status</span>
+            <StatusPill status={booked.paymentStatus} />
+          </div>
+
+          {booked.paymentStatus !== "Paid" && (
+            <>
+              {qrSrc ? (
+                <div style={{ textAlign: "center", margin: "18px 0" }}>
+                  <img src={qrSrc} alt="Payment QR code" width={200} height={200} style={{ borderRadius: 10, border: `1px solid ${COLORS.line}` }} />
+                  <div style={{ fontSize: 12, color: "#6B7A76", marginTop: 8 }}>
+                    Have the patient scan this to pay ₹{booked.opdFee}
+                  </div>
+                </div>
+              ) : (
+                <div style={{ fontSize: 12.5, color: "#6B7A76", background: COLORS.parchmentDim, borderRadius: 8, padding: "10px 12px", margin: "14px 0" }}>
+                  Payment QR isn't configured yet — collect the OPD fee directly, then mark it as paid below.
+                </div>
+              )}
+              <Button full disabled={marking} onClick={markPaid}>
+                {marking ? <Spinner /> : "Mark as Paid"}
+              </Button>
+            </>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <Button variant="ghost" full onClick={() => { setBooked(null); setDoctorId(""); setPatientId(""); setTime(""); setSymptoms(""); }}>
+            Book another visit
+          </Button>
+          <Button full onClick={onDone}>Done</Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: "0 24px 32px" }}>
+      <TopNav onBack={onBack} label="Book a Visit" />
+      <div style={{ padding: "8px 0 20px" }}>
+        <h1 style={{ fontFamily: FONT_DISPLAY, fontSize: 24, color: COLORS.ink, margin: "8px 0 4px" }}>
+          Book on their behalf
+        </h1>
+        <p style={{ fontSize: 13.5, color: "#6B7A76", margin: 0 }}>
+          Choose from the doctors and patients you've registered.
+        </p>
+      </div>
+
+      {error && <Banner text={error} tone="error" onClose={() => setError("")} />}
+
+      {loadingLists ? (
+        <div style={{ fontSize: 13, color: "#6B7A76" }}>Loading…</div>
+      ) : (
+        <>
+          <Field label="Patient" required>
+            {patients.length === 0 ? (
+              <div style={{ fontSize: 13, color: "#6B7A76" }}>You haven't registered any patients yet.</div>
+            ) : (
+              <select value={patientId} onChange={(e) => setPatientId(e.target.value)} style={{ ...inputStyle, appearance: "auto" }}>
+                <option value="">Select a patient…</option>
+                {patients.map((p) => (
+                  <option key={p.userId} value={p.userId}>{p.name} {p.surname} — {p.mobile}</option>
+                ))}
+              </select>
+            )}
+          </Field>
+
+          <Field label="Doctor" required>
+            {doctors.length === 0 ? (
+              <div style={{ fontSize: 13, color: "#6B7A76" }}>You haven't registered any doctors yet.</div>
+            ) : (
+              <select value={doctorId} onChange={(e) => { setDoctorId(e.target.value); setTime(""); }} style={{ ...inputStyle, appearance: "auto" }}>
+                <option value="">Select a doctor…</option>
+                {doctors.map((d) => (
+                  <option key={d.userId} value={d.userId}>
+                    Dr. {d.name} {d.surname}{d.specialization ? ` — ${d.specialization}` : ""} — ₹{d.opdFee}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+
+          {doctorId && (
+            <>
+              <Field label="Date" required>
+                <TextInput type="date" min={todayISO()} value={date} onChange={(e) => setDate(e.target.value)} />
+              </Field>
+
+              <Field label="Time" required>
+                {availableSlots.length === 0 ? (
+                  <div style={{ fontSize: 13, color: "#6B7A76" }}>This doctor has no OPD slots configured.</div>
+                ) : (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+                    {availableSlots.map((slot) => {
+                      const isBooked = bookedTimes.includes(slot);
+                      const isSelected = time === slot;
+                      return (
+                        <button
+                          key={slot}
+                          type="button"
+                          disabled={isBooked}
+                          onClick={() => !isBooked && setTime(slot)}
+                          style={{
+                            padding: "10px 6px", borderRadius: 9, fontSize: 13, fontWeight: 600,
+                            border: `1.5px solid ${isSelected ? COLORS.teal : COLORS.line}`,
+                            background: isBooked ? COLORS.parchmentDim : isSelected ? COLORS.teal : COLORS.white,
+                            color: isBooked ? "#B0B0B0" : isSelected ? COLORS.white : COLORS.ink,
+                            cursor: isBooked ? "not-allowed" : "pointer",
+                            textDecoration: isBooked ? "line-through" : "none",
+                          }}
+                        >
+                          {slot}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </Field>
+
+              <Field label="Symptoms" required>
+                <textarea
+                  value={symptoms}
+                  onChange={(e) => setSymptoms(e.target.value)}
+                  placeholder="Reason for the visit"
+                  rows={4}
+                  style={{ ...inputStyle, resize: "vertical", fontFamily: FONT_UI }}
+                />
+              </Field>
+
+              {selectedDoctor && (
+                <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderTop: `1px dashed ${COLORS.line}`, marginBottom: 8 }}>
+                  <span style={{ fontSize: 13, color: "#6B7A76" }}>OPD fee / your commission</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: COLORS.ink }}>
+                    ₹{selectedDoctor.opdFee} / ₹{Math.round(selectedDoctor.opdFee * 0.10 * 100) / 100}
+                  </span>
+                </div>
+              )}
+
+              <Button full disabled={submitting} onClick={submit}>
+                {submitting ? <Spinner /> : "Book Visit"}
+              </Button>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Screen: Edit Profile
 // ---------------------------------------------------------------------------
 function EditProfileScreen({ user, onBack, onSaved }) {
@@ -888,7 +1449,7 @@ function EditProfileScreen({ user, onBack, onSaved }) {
     name: user.name || "", surname: user.surname || "", address: user.address || "",
     mobile: user.mobile || "", photoUrl: user.photoUrl || "",
     city: user.city || "", area: user.area || "", opdTimings: user.opdTimings || "",
-    specialization: user.specialization || "",
+    specialization: user.specialization || "", opdFee: user.opdFee != null ? String(user.opdFee) : "",
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -912,9 +1473,13 @@ function EditProfileScreen({ user, onBack, onSaved }) {
       setError("City, area, specialization and OPD timings are required for doctors.");
       return;
     }
+    if (user.role === "Doctor" && (!form.opdFee || Number(form.opdFee) <= 0)) {
+      setError("Enter a valid OPD fee.");
+      return;
+    }
     setLoading(true);
     try {
-      const updated = { ...user, ...form };
+      const updated = { ...user, ...form, ...(user.role === "Doctor" ? { opdFee: Number(form.opdFee) } : {}) };
       await writeUserProfile(user.userId, updated);
       onSaved(updated);
     } catch (err) {
@@ -975,6 +1540,14 @@ function EditProfileScreen({ user, onBack, onSaved }) {
             </Field>
             <Field label="OPD timings" required>
               <OpdTimingsInput value={form.opdTimings} onChange={(val) => set("opdTimings", val)} />
+            </Field>
+            <Field label="OPD fee (₹)" required>
+              <TextInput
+                value={form.opdFee}
+                onChange={(e) => set("opdFee", e.target.value.replace(/[^0-9]/g, ""))}
+                placeholder="500"
+                inputMode="numeric"
+              />
             </Field>
           </>
         )}
@@ -1902,17 +2475,193 @@ function RowKV({ label, value }) {
 // ---------------------------------------------------------------------------
 // Root App
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Screen: Swasthmitra placeholder (real agent dashboard lands in a later module)
+// ---------------------------------------------------------------------------
+function SwasthmitraDashboard({ user, onLogout, onEditProfile, onRegisterDoctor, onRegisterPatient, onBookVisit }) {
+  const [tab, setTab] = useState("overview"); // overview | doctors | patients
+  const [appts, setAppts] = useState([]);
+  const [doctors, setDoctors] = useState([]);
+  const [patients, setPatients] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [markingId, setMarkingId] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const [a, d, p] = await Promise.all([
+        agentAppointmentsDirect(user.userId),
+        listMyRegisteredUsersDirect(user.userId, "Doctor"),
+        listMyRegisteredUsersDirect(user.userId, "Patient"),
+      ]);
+      setAppts(a);
+      setDoctors(d);
+      setPatients(p);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [user.userId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const totals = useMemo(() => {
+    let paid = 0, pending = 0;
+    for (const a of appts) {
+      if (a.status === "Cancelled" || !a.agentCommission) continue;
+      if (a.paymentStatus === "Paid") paid += a.agentCommission;
+      else pending += a.agentCommission;
+    }
+    return { paid: Math.round(paid * 100) / 100, pending: Math.round(pending * 100) / 100 };
+  }, [appts]);
+
+  async function markPaid(appointmentId) {
+    setMarkingId(appointmentId);
+    try {
+      await markAppointmentPaidDirect(appointmentId);
+      setAppts((list) => list.map((a) => (a.appointmentId === appointmentId ? { ...a, paymentStatus: "Paid" } : a)));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setMarkingId(null);
+    }
+  }
+
+  return (
+    <div>
+      <Header user={user} onLogout={onLogout} onEditProfile={onEditProfile} subtitle="Swasthmitra" />
+
+      <div style={{ padding: "18px 24px 0" }}>
+        <div style={{ marginBottom: 16 }}>
+          <RoleCard title="Book a Visit" desc="For a patient you've registered." icon={<IconCalendar size={20} color={COLORS.white} />} onClick={onBookVisit} />
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          <Button variant="ghost" style={{ flex: 1, padding: "10px 8px", fontSize: 12.5 }} onClick={onRegisterDoctor}>
+            + Register Doctor
+          </Button>
+          <Button variant="ghost" style={{ flex: 1, padding: "10px 8px", fontSize: 12.5 }} onClick={onRegisterPatient}>
+            + Register Patient
+          </Button>
+        </div>
+
+        <div style={{ display: "flex", background: COLORS.parchmentDim, borderRadius: 12, padding: 4, gap: 4 }}>
+          <TabButton active={tab === "overview"} onClick={() => setTab("overview")}>Visits</TabButton>
+          <TabButton active={tab === "doctors"} onClick={() => setTab("doctors")}>My Doctors</TabButton>
+          <TabButton active={tab === "patients"} onClick={() => setTab("patients")}>My Patients</TabButton>
+        </div>
+      </div>
+
+      <div style={{ padding: "18px 24px 32px" }}>
+        {error && <Banner text={error} tone="error" onClose={() => setError("")} />}
+
+        {tab === "overview" && (
+          <>
+            <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+              <div style={{ flex: 1, background: COLORS.white, border: `1.5px solid ${COLORS.line}`, borderRadius: 12, padding: "14px 14px" }}>
+                <div style={{ fontSize: 11, color: "#6B7A76", textTransform: "uppercase", letterSpacing: 0.4 }}>Commission Paid</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: COLORS.good, marginTop: 2 }}>₹{totals.paid}</div>
+              </div>
+              <div style={{ flex: 1, background: COLORS.white, border: `1.5px solid ${COLORS.line}`, borderRadius: 12, padding: "14px 14px" }}>
+                <div style={{ fontSize: 11, color: "#6B7A76", textTransform: "uppercase", letterSpacing: 0.4 }}>Commission Pending</div>
+                <div style={{ fontSize: 20, fontWeight: 700, color: COLORS.warn, marginTop: 2 }}>₹{totals.pending}</div>
+              </div>
+            </div>
+
+            {loading ? (
+              <LoadingList />
+            ) : appts.length === 0 ? (
+              <EmptyState title="No visits booked yet" desc="Book your first visit from the button above." />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {appts.map((a) => (
+                  <div key={a.appointmentId} style={{ background: COLORS.white, border: `1.5px solid ${COLORS.line}`, borderRadius: 12, padding: "16px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                      <div>
+                        <div style={{ fontSize: 14.5, fontWeight: 700, color: COLORS.ink }}>{a.patientName} → {a.doctorName}</div>
+                        <div style={{ fontSize: 12.5, color: "#6B7A76", marginTop: 2 }}>{a.date} at {a.time}</div>
+                      </div>
+                      <StatusPill status={a.status} />
+                    </div>
+                    {a.agentCommission != null && (
+                      <>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+                          <span style={{ color: "#6B7A76" }}>OPD fee ₹{a.opdFee} · Your commission</span>
+                          <span style={{ fontWeight: 700, color: COLORS.teal }}>₹{a.agentCommission}</span>
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <StatusPill status={a.paymentStatus} />
+                          {a.paymentStatus !== "Paid" && a.status !== "Cancelled" && (
+                            <Button
+                              style={{ padding: "7px 14px", fontSize: 12.5 }}
+                              disabled={markingId === a.appointmentId}
+                              onClick={() => markPaid(a.appointmentId)}
+                            >
+                              {markingId === a.appointmentId ? <Spinner size={13} /> : "Mark as Paid"}
+                            </Button>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === "doctors" && (
+          loading ? <LoadingList /> : doctors.length === 0 ? (
+            <EmptyState title="No doctors registered yet" desc="Register a doctor from the button above." />
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {doctors.map((d) => (
+                <div key={d.userId} style={{ background: COLORS.white, border: `1.5px solid ${COLORS.line}`, borderRadius: 12, padding: "14px 16px" }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 700, color: COLORS.ink }}>Dr. {d.name} {d.surname}</div>
+                  <div style={{ fontSize: 12.5, color: "#6B7A76", marginTop: 2 }}>{d.specialization} · {d.city}, {d.area}</div>
+                  <div style={{ fontSize: 12.5, color: "#6B7A76", marginTop: 2 }}>{d.mobile} · OPD fee ₹{d.opdFee}</div>
+                </div>
+              ))}
+            </div>
+          )
+        )}
+
+        {tab === "patients" && (
+          loading ? <LoadingList /> : patients.length === 0 ? (
+            <EmptyState title="No patients registered yet" desc="Register a patient from the button above." />
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {patients.map((p) => (
+                <div key={p.userId} style={{ background: COLORS.white, border: `1.5px solid ${COLORS.line}`, borderRadius: 12, padding: "14px 16px" }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 700, color: COLORS.ink }}>{p.name} {p.surname}</div>
+                  <div style={{ fontSize: 12.5, color: "#6B7A76", marginTop: 2 }}>{p.mobile}{p.address ? ` · ${p.address}` : ""}</div>
+                </div>
+              ))}
+            </div>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [screen, setScreen] = useState("role"); // role | login | register
   const [role, setRole] = useState(null);
   const [user, setUser] = useState(null);
   const [editingProfile, setEditingProfile] = useState(false);
+  const [agentRegisterRole, setAgentRegisterRole] = useState(null); // "Doctor" | "Patient" | null
+  const [agentBooking, setAgentBooking] = useState(false);
 
   function logout() {
     setUser(null);
     setScreen("role");
     setRole(null);
     setEditingProfile(false);
+    setAgentRegisterRole(null);
+    setAgentBooking(false);
   }
 
   let content;
@@ -1924,9 +2673,33 @@ export default function App() {
         onSaved={(u) => { setUser(u); setEditingProfile(false); }}
       />
     );
+  } else if (user && user.role === "Swasthmitra" && agentRegisterRole) {
+    content = (
+      <AgentRegisterScreen
+        role={agentRegisterRole}
+        agent={user}
+        onBack={() => setAgentRegisterRole(null)}
+        onDone={() => setAgentRegisterRole(null)}
+      />
+    );
+  } else if (user && user.role === "Swasthmitra" && agentBooking) {
+    content = (
+      <AgentBookingScreen
+        agent={user}
+        onBack={() => setAgentBooking(false)}
+        onDone={() => setAgentBooking(false)}
+      />
+    );
   } else if (user) {
     content = user.role === "Doctor" ? (
       <DoctorDashboard user={user} onLogout={logout} onEditProfile={() => setEditingProfile(true)} />
+    ) : user.role === "Swasthmitra" ? (
+      <SwasthmitraDashboard
+        user={user} onLogout={logout} onEditProfile={() => setEditingProfile(true)}
+        onRegisterDoctor={() => setAgentRegisterRole("Doctor")}
+        onRegisterPatient={() => setAgentRegisterRole("Patient")}
+        onBookVisit={() => setAgentBooking(true)}
+      />
     ) : (
       <PatientDashboard user={user} onLogout={logout} onEditProfile={() => setEditingProfile(true)} />
     );
