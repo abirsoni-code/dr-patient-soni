@@ -1,12 +1,33 @@
 # Doctor-Patient Visit App
 
-React + Vite PWA. Backend is a small JSON-based data store, run two ways
-from the same shared logic in shared/dataEngine.cjs:
+React + Vite PWA. No backend server — the app talks to Firebase directly
+from the browser:
 
-- Local dev: server/index.cjs (Express) reads/writes server/data/db.json
-- Netlify: netlify/functions/api.js (same logic, using Netlify Blobs storage)
+- **Firebase Authentication** handles login and registration
+- **Cloud Firestore** stores everything else (profiles, appointments,
+  prescriptions), read and written directly by the client, authorized by
+  `firestore.rules`
 
-No Google account, no external service, no manual deployment steps required
-for either environment.
+Runs entirely on Firebase's free Spark plan — no Cloud Functions, no
+Firebase Storage, no billing account required.
 
-See the setup instructions provided separately for exact run/deploy steps.
+## Local development
+
+```bash
+npm install
+npm run dev
+```
+
+To test against Firestore locally instead of the deployed project, use the
+Firebase emulators:
+
+```bash
+firebase emulators:start --only firestore,auth
+```
+
+## Deploy
+
+```bash
+npm run build
+firebase deploy --only hosting,firestore:rules
+```

@@ -21,25 +21,10 @@ export default defineConfig({
           { src: "icon-512.png", sizes: "512x512", type: "image/png" },
           { src: "icon-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" }
         ]
-      },
-      workbox: {
-        // Cache the app shell; API calls always go to the network, never cached.
-        runtimeCaching: [
-          {
-            urlPattern: ({ url }) => url.pathname.startsWith("/api"),
-            handler: "NetworkOnly"
-          }
-        ]
       }
     })
   ],
   server: {
-    port: 5173,
-    proxy: {
-      "/api": {
-        target: "http://localhost:8787",
-        changeOrigin: true
-      }
-    }
+    port: 5173
   }
 });

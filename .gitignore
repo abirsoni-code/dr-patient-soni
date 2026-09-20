@@ -5,6 +5,4 @@ dist-ssr
 .DS_Store
 .vscode/*
 !.vscode/extensions.json
-.netlify
-server/data/db.json
-server/data/photos
+.firebase
