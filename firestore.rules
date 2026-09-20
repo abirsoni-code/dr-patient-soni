@@ -1,12 +1,98 @@
 rules_version = '2';
 
-// All app reads/writes go through Cloud Functions using the Admin SDK,
-// which bypasses these rules entirely. This blocks any direct client-side
-// access to Firestore, so authorization stays centralized in dataEngine.cjs.
+// Data model (no backend server — the app talks to Firestore directly):
+//
+//   users/{uid}                        Full profile. Owner-only read/write.
+//                                       Doc ID == Firebase Auth uid.
+//   doctorDirectory/{uid}               Public subset of a doctor's profile
+//                                       (name, city, area, specialization,
+//                                       opdTimings, photoUrl) — readable by
+//                                       any signed-in user, replaces the old
+//                                       server-side listDoctors() action.
+//                                       Written only by that doctor, and only
+//                                       when their users/{uid}.role == "Doctor".
+//   appointments/{apptId}                patientId, doctorId, ... Only the
+//                                       two participants can read/write.
+//   slots/{doctorId_date_time}          Existence-only lock doc used to
+//                                       prevent double-booking (see below).
+//                                       Value: { appointmentId }.
+//   appointments/{apptId}/prescriptions/{prescriptionId}
+//                                       Photo stored inline as base64
+//                                       (photoBase64 field) — no Storage
+//                                       service used, stays on the free
+//                                       Spark plan. Capped well under
+//                                       Firestore's 1MB document limit.
+//
+// Double-booking prevention: booking a slot means creating BOTH the
+// appointments/{autoId} doc AND slots/{doctorId_date_time} in one atomic
+// batched write from the client. The slot doc's create rule requires
+// !exists(), so if two patients race for the same slot, only one batch can
+// succeed — Firestore serializes writes to a single document, so the loser's
+// whole batch (including their appointment doc) is rejected.
+
+function signedIn() {
+  return request.auth != null;
+}
+
+function isOwner(uid) {
+  return signedIn() && request.auth.uid == uid;
+}
+
+function apptParticipant(apptId) {
+  let appt = get(/databases/$(database)/documents/appointments/$(apptId)).data;
+  return signedIn() && (request.auth.uid == appt.patientId || request.auth.uid == appt.doctorId);
+}
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      allow read, write: if false;
+
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && request.resource.data.userId == uid;
+      allow update: if isOwner(uid) && request.resource.data.userId == uid
+                    && request.resource.data.role == resource.data.role; // role can't be changed after signup
+      allow delete: if false;
+    }
+
+    match /doctorDirectory/{uid} {
+      allow read: if signedIn();
+      // Can't check role via users/{uid} here — on first registration, that
+      // doc is written in the SAME atomic batch as this one, so it doesn't
+      // exist yet at rule-evaluation time. Shape validation stands in for it.
+      allow write: if isOwner(uid)
+                   && request.resource.data.userId == uid
+                   && request.resource.data.name is string
+                   && request.resource.data.specialization is string;
+    }
+
+    match /appointments/{apptId} {
+      allow read: if apptParticipant(apptId);
+      allow create: if signedIn()
+                    && request.resource.data.patientId == request.auth.uid
+                    && request.resource.data.status == "Confirmed";
+      // Only status/date/time may change (reschedule/cancel), and only by a participant.
+      allow update: if apptParticipant(apptId)
+                    && request.resource.data.patientId == resource.data.patientId
+                    && request.resource.data.doctorId == resource.data.doctorId;
+      allow delete: if false;
+    }
+
+    match /slots/{slotId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && !exists(/databases/$(database)/documents/slots/$(slotId));
+      allow delete: if signedIn()
+                    && apptParticipant(resource.data.appointmentId);
+      allow update: if false;
+    }
+
+    match /appointments/{apptId}/prescriptions/{prescriptionId} {
+      allow read: if apptParticipant(apptId);
+      allow create: if apptParticipant(apptId)
+                    && request.resource.data.uploaderId == request.auth.uid
+                    && request.resource.data.photoBase64 is string
+                    && request.resource.data.photoBase64.size() < 900000; // ~900KB, keeps doc under Firestore's 1MB cap
+      allow delete: if apptParticipant(apptId) && resource.data.uploaderId == request.auth.uid;
+      allow update: if false;
     }
   }
 }

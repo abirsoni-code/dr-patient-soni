@@ -1,12 +1,27 @@
 rules_version = '2';
 
-// Prescription photos are uploaded/read only through Cloud Functions using
-// the Admin SDK (which bypasses these rules), so uploader/participant-only
-// authorization stays centralized in dataEngine.cjs instead of duplicated here.
+// Prescription photos live at prescriptions/{appointmentId}/{prescriptionId}.
+// Authorization mirrors firestore.rules: only the two participants on the
+// linked appointment doc can read; only the original uploader can delete
+// (the client must set customMetadata.uploaderId at upload time).
 service firebase.storage {
   match /b/{bucket}/o {
-    match /{allPaths=**} {
-      allow read, write: if false;
+    match /prescriptions/{apptId}/{prescriptionId} {
+      function appt() {
+        return firestore.get(/databases/(default)/documents/appointments/$(apptId)).data;
+      }
+      function isParticipant() {
+        return request.auth != null &&
+          (request.auth.uid == appt().patientId || request.auth.uid == appt().doctorId);
+      }
+
+      allow read: if isParticipant();
+      allow create: if isParticipant()
+                    && request.resource.contentType.matches("image/.*")
+                    && request.resource.size < 8 * 1024 * 1024;
+      allow delete: if isParticipant()
+                    && resource.metadata.uploaderId == request.auth.uid;
+      allow update: if false;
     }
   }
 }

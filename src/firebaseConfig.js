@@ -2,6 +2,7 @@
 // Not yet used by App.jsx — wired in during the Auth step of the migration.
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
+import { getFirestore } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: "AIzaSyCEHhzEP8jtzPkre9Og-4LOgHVXFfDFDC4",
@@ -14,3 +15,4 @@ const firebaseConfig = {
 
 export const firebaseApp = initializeApp(firebaseConfig);
 export const auth = getAuth(firebaseApp);
+export const db = getFirestore(firebaseApp);
