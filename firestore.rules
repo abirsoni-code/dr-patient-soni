@@ -58,10 +58,20 @@ function isOwner(uid) {
   return signedIn() && request.auth.uid == uid;
 }
 
-function apptParticipant(apptId) {
-  let appt = get(/databases/$(database)/documents/appointments/$(apptId)).data;
+// Used directly on an appointment doc's own read/update rules, where
+// resource.data is already the document being evaluated — no get() needed.
+// (A self-referential get() here previously broke agentAppointmentsDirect's
+// list query: Firestore's rule engine can't reliably resolve a get() call
+// that reads the very same document a list query is evaluating.)
+function isApptParticipantData(appt) {
   return signedIn() && (request.auth.uid == appt.patientId || request.auth.uid == appt.doctorId
                         || ("agentId" in appt && request.auth.uid == appt.agentId));
+}
+
+// Used when a DIFFERENT document (slots, prescriptions) needs to check
+// participant status on the appointment it references.
+function apptParticipant(apptId) {
+  return isApptParticipantData(get(/databases/$(database)/documents/appointments/$(apptId)).data);
 }
 
 service cloud.firestore {
@@ -98,7 +108,7 @@ service cloud.firestore {
     }
 
     match /appointments/{apptId} {
-      allow read: if apptParticipant(apptId);
+      allow read: if isApptParticipantData(resource.data);
       allow create: if signedIn()
                     && request.resource.data.status == "Confirmed"
                     && (request.resource.data.patientId == request.auth.uid
@@ -107,7 +117,7 @@ service cloud.firestore {
       // and only by a participant. patientId/doctorId can't be reassigned.
       // (agentId is intentionally not checked here — older appointment docs
       // predating this field would throw on a missing-field read otherwise.)
-      allow update: if apptParticipant(apptId)
+      allow update: if isApptParticipantData(resource.data)
                     && request.resource.data.patientId == resource.data.patientId
                     && request.resource.data.doctorId == resource.data.doctorId;
       allow delete: if false;
